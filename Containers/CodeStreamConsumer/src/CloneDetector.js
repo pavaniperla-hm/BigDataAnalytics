@@ -7,12 +7,19 @@ const closeMultiLineComment = /^[\*\/]*\*+\//;
 const SourceLine = require('./SourceLine');
 const FileStorage = require('./FileStorage');
 const Clone = require('./Clone');
+const Timer = require('./Timer');
 
 const DEFAULT_CHUNKSIZE = 5;
 
 class CloneDetector {
     #myChunkSize = process.env.CHUNKSIZE || DEFAULT_CHUNKSIZE;
     #myFileStore = FileStorage.getInstance();
+
+    // total number of chunk-to-chunk comparisons performed so far
+    static #comparisonCount = 0;
+    static getComparisonCount() { return CloneDetector.#comparisonCount; }
+    // convenience: current effective chunk size
+    static getChunkSize() { return Number(process.env.CHUNKSIZE || DEFAULT_CHUNKSIZE); }
 
     static #processedFiles = 0;
 
@@ -118,6 +125,8 @@ class CloneDetector {
             const fChunk = fChunks[i];
             for (let j = 0; j < cChunks.length; j++) {
                 const cChunk = cChunks[j];
+                // increment comparison counter for each chunk-pair we examine
+                CloneDetector.#comparisonCount++;
                 if (this.#chunkMatch(fChunk, cChunk)) {
                     // create a Clone instance: source=file.name, target=compareFile.name
                     const clone = new Clone(file.name, compareFile.name, fChunk, cChunk);
@@ -187,9 +196,14 @@ class CloneDetector {
     }
 
     matchDetect(file) {
-        // Compare this file's chunks against all previously stored files and build instances
+        // The outer 'match' timer is started in index.js.
+        // Here we measure sub-steps to give more detailed timings:
+        // - candidateSearch: scanning stored files and matching chunks
+        // - expand: expanding adjacent chunk matches
+        // - consolidate: removing duplicates / merging targets
         const candidates = [];
 
+        Timer.startTimer(file, 'candidateSearch');
         for (const otherFile of this.#myFileStore.getAllFiles()) {
             // ensure the other file has been transformed
             if (!otherFile.chunks) continue;
@@ -198,12 +212,17 @@ class CloneDetector {
                 candidates.push(...found);
             }
         }
+        Timer.endTimer(file, 'candidateSearch');
 
         file.instances = candidates;
-        // Try expanding adjacent chunks into longer clones
+
+        Timer.startTimer(file, 'expand');
         this.#expandCloneCandidates(file);
-        // Consolidate duplicate clones merging targets
+        Timer.endTimer(file, 'expand');
+
+        Timer.startTimer(file, 'consolidate');
         this.#consolidateClones(file);
+        Timer.endTimer(file, 'consolidate');
 
         return file;
     }
