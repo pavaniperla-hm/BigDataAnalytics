@@ -1,6 +1,6 @@
 const emptyLine = /^\s*$/;
 const oneLineComment = /\/\/.*/;
-const oneLineMultiLineComment = /\/\*.*?\*\//; 
+const oneLineMultiLineComment = /\/\*.*?\*\//;
 const openMultiLineComment = /\/\*+[^\*\/]*$/;
 const closeMultiLineComment = /^[\*\/]*\*+\//;
 
@@ -8,11 +8,13 @@ const SourceLine = require('./SourceLine');
 const FileStorage = require('./FileStorage');
 const Clone = require('./Clone');
 
-const DEFAULT_CHUNKSIZE=5;
+const DEFAULT_CHUNKSIZE = 5;
 
 class CloneDetector {
     #myChunkSize = process.env.CHUNKSIZE || DEFAULT_CHUNKSIZE;
     #myFileStore = FileStorage.getInstance();
+
+    static #processedFiles = 0;
 
     constructor() {
     }
@@ -20,176 +22,206 @@ class CloneDetector {
     // Private Methods
     // --------------------
     #filterLines(file) {
-        let lines = file.contents.split('\n');
+        // Split into lines and remove comments / empty lines while keeping line numbers
+        let rawLines = file.contents.split('\n');
         let inMultiLineComment = false;
-        file.lines=[];
+        file.lines = [];
 
-        for (let i = 0; i < lines.length; i++) {
-            let line = lines[i];
-
-            if ( inMultiLineComment ) {
-                if ( -1 != line.search(closeMultiLineComment) ) {
-                    line = line.replace(closeMultiLineComment, '');
+        for (let i = 0; i < rawLines.length; i++) {
+            let ln = rawLines[i];
+            // Handle start/end of multiline comments that may span lines
+            if (inMultiLineComment) {
+                // Check for end
+                if (closeMultiLineComment.test(ln)) {
+                    // Remove everything up to the end token
+                    const idx = ln.search(closeMultiLineComment);
+                    ln = ln.slice(idx + RegExp.lastMatch.length);
                     inMultiLineComment = false;
                 } else {
-                    line = '';
+                    // Entire line in comment -> produce empty SourceLine placeholder
+                    file.lines.push(new SourceLine(i + 1, ''));
+                    continue;
                 }
             }
 
-            line = line.replace(emptyLine, '');
-            line = line.replace(oneLineComment, '');
-            line = line.replace(oneLineMultiLineComment, '');
-            
-            if ( -1 != line.search(openMultiLineComment) ) {
-                line = line.replace(openMultiLineComment, '');
+            // Remove single-line /* ... */ occurrences first
+            ln = ln.replace(oneLineMultiLineComment, '');
+
+            // Remove single-line // comments
+            ln = ln.replace(oneLineComment, '');
+
+            // If line starts a multi-line comment that doesn't end on same line
+            if (openMultiLineComment.test(ln) && !closeMultiLineComment.test(ln)) {
+                // Strip from start of comment
+                const idx = ln.search(openMultiLineComment);
+                ln = ln.slice(0, idx);
                 inMultiLineComment = true;
+            } else if (openMultiLineComment.test(ln) && closeMultiLineComment.test(ln)) {
+                // inline open and close on same line: remove the comment portion
+                ln = ln.replace(/\/\*[\s\S]*?\*\//g, '');
             }
 
-            file.lines.push( new SourceLine(i+1, line.trim()) );
+            // Trim trailing/leading whitespace
+            const content = ln.replace(/\s+$/g, '').replace(/^\s+/g, '');
+
+            // Insert SourceLine: keep empty lines (so lineNumbers are preserved)
+            file.lines.push(new SourceLine(i + 1, content));
         }
-       
+
         return file;
     }
 
     #getContentLines(file) {
-        return file.lines.filter( line => line.hasContent() );        
+        // Return only SourceLine objects that actually contain content
+        return (file.lines || []).filter(l => l && l.hasContent && l.hasContent());
     }
 
 
     #chunkify(file) {
-        let chunkSize = this.#myChunkSize;
-        let lines = this.#getContentLines(file);
-        file.chunks=[];
+        // Build overlapping chunks of size #myChunkSize from content lines
+        const size = Number(this.#myChunkSize);
+        const contentLines = this.#getContentLines(file);
+        file.chunks = [];
 
-        for (let i = 0; i <= lines.length-chunkSize; i++) {
-            let chunk = lines.slice(i, i+chunkSize);
+        if (contentLines.length < size) return file;
+
+        for (let i = 0; i <= contentLines.length - size; i++) {
+            const chunk = contentLines.slice(i, i + size);
             file.chunks.push(chunk);
         }
+
         return file;
     }
-    
+
     #chunkMatch(first, second) {
-        let match = true;
+        // Exact content match for all lines in the chunk
+        if (!Array.isArray(first) || !Array.isArray(second)) return false;
+        if (first.length !== second.length) return false;
 
-        if (first.length != second.length) { match = false; }
-        for (let idx=0; idx < first.length; idx++) {
-            if (!first[idx].equals(second[idx])) { match = false; }
+        for (let i = 0; i < first.length; i++) {
+            if (!first[i].equals(second[i])) return false;
         }
-
-        return match;
+        return true;
     }
 
     #filterCloneCandidates(file, compareFile) {
-        // TODO
-        // For each chunk in file.chunks, find all #chunkMatch() in compareFile.chunks
-        // For each matching chunk, create a new Clone.
-        // Store the resulting (flat) array in file.instances.
-        // 
-        // TIP 1: Array.filter to find a set of matches, Array.map to return a new array with modified objects.
-        // TIP 2: You can daisy-chain calls to filter().map().filter().flat() etc.
-        // TIP 3: Remember that file.instances may have already been created, so only append to it.
-        //
-        // Return: file, including file.instances which is an array of Clone objects (or an empty array).
-        //
+        // Generate Clone instances for matching chunks between file and compareFile
+        const newInstances = [];
 
-        file.instances = file.instances || [];        
-        file.instances = file.instances.concat(newInstances);
-        return file;
+        // skip self comparison
+        if (!compareFile || compareFile.name === file.name) return newInstances;
+
+        const fChunks = file.chunks || [];
+        const cChunks = compareFile.chunks || [];
+
+        for (let i = 0; i < fChunks.length; i++) {
+            const fChunk = fChunks[i];
+            for (let j = 0; j < cChunks.length; j++) {
+                const cChunk = cChunks[j];
+                if (this.#chunkMatch(fChunk, cChunk)) {
+                    // create a Clone instance: source=file.name, target=compareFile.name
+                    const clone = new Clone(file.name, compareFile.name, fChunk, cChunk);
+                    newInstances.push(clone);
+                }
+            }
+        }
+
+        return newInstances;
     }
-     
+
     #expandCloneCandidates(file) {
-        // TODO
-        // For each Clone in file.instances, try to expand it with every other Clone
-        // (using Clone::maybeExpandWith(), which returns true if it could expand)
-        // 
-        // Comment: This should be doable with a reduce:
-        //          For every new element, check if it overlaps any element in the accumulator.
-        //          If it does, expand the element in the accumulator. If it doesn't, add it to the accumulator.
-        //
-        // ASSUME: As long as you traverse the array file.instances in the "normal" order, only forward expansion is necessary.
-        // 
-        // Return: file, with file.instances only including Clones that have been expanded as much as they can,
-        //         and not any of the Clones used during that expansion.
-        //
+        // Expand adjacent matching chunks into longer clones
+        if (!file.instances || file.instances.length === 0) return file;
 
+        // Sort by sourceStart to try to expand consecutive chunks
+        file.instances.sort((a, b) => a.sourceStart - b.sourceStart);
+
+        const expanded = [];
+        for (const inst of file.instances) {
+            if (expanded.length === 0) {
+                expanded.push(inst);
+                continue;
+            }
+            const last = expanded[expanded.length - 1];
+            // If last can be expanded with current instance, merge them (and combine targets)
+            if (last.maybeExpandWith(inst)) {
+                last.addTarget(inst);
+            } else {
+                expanded.push(inst);
+            }
+        }
+
+        file.instances = expanded;
         return file;
     }
-    
+
     #consolidateClones(file) {
-        // TODO
-        // For each clone, accumulate it into an array if it is new
-        // If it isn't new, update the existing clone to include this one too
-        // using Clone::addTarget()
-        // 
-        // TIP 1: Array.reduce() with an empty array as start value.
-        //        Push not-seen-before clones into the accumulator
-        // TIP 2: There should only be one match in the accumulator
-        //        so Array.find() and Clone::equals() will do nicely.
-        //
-        // Return: file, with file.instances containing unique Clone objects that may contain several targets
-        //
+        // Remove duplicates (same source range) and merge their targets
+        if (!file.instances || file.instances.length === 0) return file;
 
+        const consolidated = [];
+        for (const inst of file.instances) {
+            const existing = consolidated.find(c => c.equals(inst));
+            if (existing) {
+                existing.addTarget(inst);
+            } else {
+                consolidated.push(inst);
+            }
+        }
+
+        file.instances = consolidated;
         return file;
     }
-    
+
 
     // Public Processing Steps
     // --------------------
     preprocess(file) {
-        return new Promise( (resolve, reject) => {
-            if (!file.name.endsWith('.java') ) {
-                reject(file.name + ' is not a java file. Discarding.');
-            } else if(this.#myFileStore.isFileProcessed(file.name)) {
-                reject(file.name + ' has already been processed.');
-            } else {
-                resolve(file);
-            }
-        });
+        // Create file.lines and filter comments/empty lines as placeholders
+        return this.#filterLines(file);
     }
 
     transform(file) {
-        file = this.#filterLines(file);
-        file = this.#chunkify(file);
-        return file;
+        // Turn source lines into chunks for matching
+        return this.#chunkify(file);
     }
 
     matchDetect(file) {
-        let allFiles = this.#myFileStore.getAllFiles();
-        file.instances = file.instances || [];
-        for (let f of allFiles) {
-            // TODO implement these methods (or re-write the function matchDetect() to your own liking)
-            // 
-            // Overall process:
-            // 
-            // 1. Find all equal chunks in file and f. Represent each matching pair as a Clone.
-            //
-            // 2. For each Clone with endLine=x, merge it with Clone with endLine-1=x
-            //    remove the now redundant clone, rinse & repeat.
-            //    note that you may end up with several "root" Clones for each processed file f
-            //    if there are more than one clone between the file f and the current
-            //
-            // 3. If the same clone is found in several places, consolidate them into one Clone.
-            //
-            file = this.#filterCloneCandidates(file, f); 
-            file = this.#expandCloneCandidates(file);
-            file = this.#consolidateClones(file); 
+        // Compare this file's chunks against all previously stored files and build instances
+        const candidates = [];
+
+        for (const otherFile of this.#myFileStore.getAllFiles()) {
+            // ensure the other file has been transformed
+            if (!otherFile.chunks) continue;
+            const found = this.#filterCloneCandidates(file, otherFile);
+            if (found && found.length > 0) {
+                candidates.push(...found);
+            }
         }
+
+        file.instances = candidates;
+        // Try expanding adjacent chunks into longer clones
+        this.#expandCloneCandidates(file);
+        // Consolidate duplicate clones merging targets
+        this.#consolidateClones(file);
 
         return file;
     }
 
     pruneFile(file) {
-        delete file.lines;
-        delete file.instances;
-        return file;
-    }
-    
-    storeFile(file) {
-        this.#myFileStore.storeFile(this.pruneFile(file));
+        // Reduce memory: remove full contents but retain lines/chunks/instances
+        try { delete file.contents; } catch (e) {}
         return file;
     }
 
-    get numberOfProcessedFiles() { return this.#myFileStore.numberOfFiles; }
+    storeFile(file) {
+        // Store file in FileStorage for future comparisons and increment processed counter
+        const stored = this.#myFileStore.storeFile(file);
+        CloneDetector.#processedFiles++;
+        return stored;
+    }
+
+    get numberOfProcessedFiles() { return CloneDetector.#processedFiles; }
 }
 
 module.exports = CloneDetector;

@@ -16,7 +16,7 @@ class FileStorage {
     get filenames() { return this.#myFileNames; }
 
     isFileProcessed(fileName) {
-        return false; // FIXME: sometimes this returns true even when it shouldn't. Probably a race condition.
+        // Return true if filename already stored. Keep this simple for now.
         return this.#myFileNames.includes(fileName);
     }
 

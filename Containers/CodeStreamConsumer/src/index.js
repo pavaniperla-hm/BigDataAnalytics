@@ -10,6 +10,9 @@ const CloneStorage = require('./CloneStorage');
 const FileStorage = require('./FileStorage');
 
 
+const FILE_TIMERS = []; // recent timings
+const MAX_TIMER_RECORDS = 500;
+
 // Express and Formidable stuff to receice a file for further processing
 // --------------------
 const form = formidable({multiples:false});
@@ -24,6 +27,7 @@ function fileReceiver(req, res, next) {
 }
 
 app.get('/', viewClones );
+app.get('/timers', viewTimers );
 
 const server = app.listen(PORT, () => { console.log('Listening for files on port', PORT); });
 
@@ -91,6 +95,26 @@ function viewClones(req, res, next) {
     res.send(page);
 }
 
+// New: timers trends page
+function viewTimers(req, res, next) {
+    let page = '<HTML><HEAD><TITLE>CodeStream Timers</TITLE></HEAD>\n';
+    page += '<BODY><H1>CodeStream Timers</H1>\n';
+    page += '<P>Processed files: ' + (FileStorage.getInstance().numberOfFiles || 0) + '</P>\n';
+    page += '<H2>Recent file timings (most recent first)</H2>\n';
+    page += '<table border="1"><tr><th>Time</th><th>File</th><th>Lines</th><th>Total ms</th><th>Match ms</th><th>Total µs/line</th></tr>\n';
+
+    for (const rec of FILE_TIMERS.slice().reverse()) {
+        const totalMs = Number(rec.total) / 1_000_000;
+        const matchMs = Number(rec.match) / 1_000_000;
+        const perLineUs = rec.lines ? (Number(rec.total) / BigInt(rec.lines) / 1000) : 0;
+        page += `<tr><td>${new Date(rec.ts).toISOString()}</td><td>${rec.name}</td><td>${rec.lines}</td><td>${totalMs.toFixed(3)}</td><td>${matchMs.toFixed(3)}</td><td>${perLineUs}</td></tr>\n`;
+    }
+
+    page += '</table>\n';
+    page += '</BODY></HTML>';
+    res.send(page);
+}
+
 // Some helper functions
 // --------------------
 // PASS is used to insert functions in a Promise stream and pass on all input parameters untouched.
@@ -127,28 +151,37 @@ function maybePrintStatistics(file, cloneDetector, cloneStore) {
 function processFile(filename, contents) {
     let cd = new CloneDetector();
     let cloneStore = CloneStorage.getInstance();
-
+ 
     return Promise.resolve({name: filename, contents: contents} )
-        //.then( PASS( (file) => console.log('Processing file:', file.name) ))
         .then( (file) => Timer.startTimer(file, 'total') )
         .then( (file) => cd.preprocess(file) )
         .then( (file) => cd.transform(file) )
-
+ 
         .then( (file) => Timer.startTimer(file, 'match') )
         .then( (file) => cd.matchDetect(file) )
         .then( (file) => cloneStore.storeClones(file) )
         .then( (file) => Timer.endTimer(file, 'match') )
-
+ 
         .then( (file) => cd.storeFile(file) )
         .then( (file) => Timer.endTimer(file, 'total') )
         .then( PASS( (file) => lastFile = file ))
+        .then( PASS( (file) => {
+            // Capture timers for the /timers page
+            const timers = Timer.getTimers(file) || {};
+            FILE_TIMERS.push({
+                ts: Date.now(),
+                name: file.name,
+                lines: Array.isArray(file.lines) ? file.lines.length : 0,
+                total: timers.total || 0n,
+                match: timers.match || 0n
+            });
+            if (FILE_TIMERS.length > MAX_TIMER_RECORDS) FILE_TIMERS.shift();
+            return file;
+        }))
         .then( PASS( (file) => maybePrintStatistics(file, cd, cloneStore) ))
-    // TODO Store the timers from every file (or every 10th file), create a new landing page /timers
-    // and display more in depth statistics there. Examples include:
-    // average times per file, average times per last 100 files, last 1000 files.
-    // Perhaps throw in a graph over all files.
         .catch( console.log );
 };
+
 
 /*
 1. Preprocessing: Remove uninteresting code, determine source and comparison units/granularities
