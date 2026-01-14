@@ -1,3 +1,5 @@
+const crypto = require('crypto');
+
 const emptyLine = /^\s*$/;
 const oneLineComment = /\/\/.*/;
 const oneLineMultiLineComment = /\/\*.*?\*\//;
@@ -21,59 +23,60 @@ class CloneDetector {
     // convenience: current effective chunk size
     static getChunkSize() { return Number(process.env.CHUNKSIZE || DEFAULT_CHUNKSIZE); }
 
+    // inverted index: Map<hash, Array<{ name, chunkIndex, chunk }>>
+
+    static #invertedIndex = new Map();
+
     static #processedFiles = 0;
 
     constructor() {
     }
 
+    // --- Helpers for indexing / hashing ---
+    #hashChunk(chunk) {
+        // Use chunk content (preserving order) as hash input
+        const s = chunk.map(l => l.getContent()).join('\n');
+        return crypto.createHash('sha1').update(s).digest('hex');
+    }
+
+    #indexAddFile(file) {
+        const chunks = file.chunks || [];
+        for (let i = 0; i < chunks.length; i++) {
+            const chunk = chunks[i];
+            const h = this.#hashChunk(chunk);
+            const arr = CloneDetector.#invertedIndex.get(h) || [];
+            arr.push({ name: file.name, chunkIndex: i, chunk });
+            CloneDetector.#invertedIndex.set(h, arr);
+        }
+    }
+
+    static getIndexSize() {
+        return CloneDetector.#invertedIndex.size;
+    }
+
     // Private Methods
     // --------------------
     #filterLines(file) {
-        // Split into lines and remove comments / empty lines while keeping line numbers
-        let rawLines = file.contents.split('\n');
-        let inMultiLineComment = false;
-        file.lines = [];
+        // Safer approach:
+        // 1) Remove all /* ... */ regions while preserving line counts (replace multiline matches with same number of newlines)
+        // 2) Remove // comments (to end of line)
+        // 3) Split into lines and keep original line numbers (empty lines are kept)
+        let contents = String(file.contents || '');
 
-        for (let i = 0; i < rawLines.length; i++) {
-            let ln = rawLines[i];
-            // Handle start/end of multiline comments that may span lines
-            if (inMultiLineComment) {
-                // Check for end
-                if (closeMultiLineComment.test(ln)) {
-                    // Remove everything up to the end token
-                    const idx = ln.search(closeMultiLineComment);
-                    ln = ln.slice(idx + RegExp.lastMatch.length);
-                    inMultiLineComment = false;
-                } else {
-                    // Entire line in comment -> produce empty SourceLine placeholder
-                    file.lines.push(new SourceLine(i + 1, ''));
-                    continue;
-                }
-            }
+        // Remove /* ... */ matches but preserve newline count so line numbers stay aligned
+        contents = contents.replace(/\/\*[\s\S]*?\*\//g, (m) => {
+            const nl = (m.match(/\n/g) || []).length;
+            return nl > 0 ? '\n'.repeat(nl) : '';
+        });
 
-            // Remove single-line /* ... */ occurrences first
-            ln = ln.replace(oneLineMultiLineComment, '');
+        // Remove // comments (to end of line) - use multiline flag
+        contents = contents.replace(/\/\/.*$/gm, '');
 
-            // Remove single-line // comments
-            ln = ln.replace(oneLineComment, '');
-
-            // If line starts a multi-line comment that doesn't end on same line
-            if (openMultiLineComment.test(ln) && !closeMultiLineComment.test(ln)) {
-                // Strip from start of comment
-                const idx = ln.search(openMultiLineComment);
-                ln = ln.slice(0, idx);
-                inMultiLineComment = true;
-            } else if (openMultiLineComment.test(ln) && closeMultiLineComment.test(ln)) {
-                // inline open and close on same line: remove the comment portion
-                ln = ln.replace(/\/\*[\s\S]*?\*\//g, '');
-            }
-
-            // Trim trailing/leading whitespace
-            const content = ln.replace(/\s+$/g, '').replace(/^\s+/g, '');
-
-            // Insert SourceLine: keep empty lines (so lineNumbers are preserved)
-            file.lines.push(new SourceLine(i + 1, content));
-        }
+        const rawLines = contents.split('\n');
+        file.lines = rawLines.map((ln, idx) => {
+            const content = String(ln).replace(/\s+$/g, '').replace(/^\s+/g, '');
+            return new SourceLine(idx + 1, content);
+        });
 
         return file;
     }
@@ -111,25 +114,23 @@ class CloneDetector {
         return true;
     }
 
-    #filterCloneCandidates(file, compareFile) {
-        // Generate Clone instances for matching chunks between file and compareFile
+    // find candidates using the inverted index (hash -> bucket)
+    #findCandidatesUsingIndex(file) {
         const newInstances = [];
+        if (!file.chunks || file.chunks.length === 0) return newInstances;
 
-        // skip self comparison
-        if (!compareFile || compareFile.name === file.name) return newInstances;
+        for (let i = 0; i < file.chunks.length; i++) {
+            const fChunk = file.chunks[i];
+            const h = this.#hashChunk(fChunk);
+            const bucket = CloneDetector.#invertedIndex.get(h) || [];
 
-        const fChunks = file.chunks || [];
-        const cChunks = compareFile.chunks || [];
-
-        for (let i = 0; i < fChunks.length; i++) {
-            const fChunk = fChunks[i];
-            for (let j = 0; j < cChunks.length; j++) {
-                const cChunk = cChunks[j];
-                // increment comparison counter for each chunk-pair we examine
+            for (const entry of bucket) {
+                // skip same-file entries
+                if (entry.name === file.name) continue;
+                // count the verification and verify content to avoid false positives
                 CloneDetector.#comparisonCount++;
-                if (this.#chunkMatch(fChunk, cChunk)) {
-                    // create a Clone instance: source=file.name, target=compareFile.name
-                    const clone = new Clone(file.name, compareFile.name, fChunk, cChunk);
+                if (this.#chunkMatch(fChunk, entry.chunk)) {
+                    const clone = new Clone(file.name, entry.name, fChunk, entry.chunk);
                     newInstances.push(clone);
                 }
             }
@@ -196,22 +197,9 @@ class CloneDetector {
     }
 
     matchDetect(file) {
-        // The outer 'match' timer is started in index.js.
-        // Here we measure sub-steps to give more detailed timings:
-        // - candidateSearch: scanning stored files and matching chunks
-        // - expand: expanding adjacent chunk matches
-        // - consolidate: removing duplicates / merging targets
-        const candidates = [];
-
+        // Use inverted index to find candidates efficiently
         Timer.startTimer(file, 'candidateSearch');
-        for (const otherFile of this.#myFileStore.getAllFiles()) {
-            // ensure the other file has been transformed
-            if (!otherFile.chunks) continue;
-            const found = this.#filterCloneCandidates(file, otherFile);
-            if (found && found.length > 0) {
-                candidates.push(...found);
-            }
-        }
+        const candidates = this.#findCandidatesUsingIndex(file);
         Timer.endTimer(file, 'candidateSearch');
 
         file.instances = candidates;
@@ -234,10 +222,18 @@ class CloneDetector {
     }
 
     storeFile(file) {
-        // Store file in FileStorage for future comparisons and increment processed counter
-        const stored = this.#myFileStore.storeFile(file);
-        CloneDetector.#processedFiles++;
-        return stored;
+        // Only index/store if not already processed
+        if (!this.#myFileStore.isFileProcessed(file.name)) {
+            this.#myFileStore.storeFile(file);
+            if (file.chunks && file.chunks.length > 0) {
+                this.#indexAddFile(file);
+            }
+            CloneDetector.#processedFiles++;
+        } else {
+            // ensure file is present in storage (idempotent)
+            this.#myFileStore.storeFile(file);
+        }
+        return file;
     }
 
     get numberOfProcessedFiles() { return CloneDetector.#processedFiles; }

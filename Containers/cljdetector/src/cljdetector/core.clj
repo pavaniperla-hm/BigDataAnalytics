@@ -2,14 +2,22 @@
   (:require [clojure.string :as string]
             [cljdetector.process.source-processor :as source-processor]
             [cljdetector.process.expander :as expander]
-            [cljdetector.storage.storage :as storage]))
+            [cljdetector.storage.storage :as storage])
+  (:import [java.lang.management ManagementFactory]))
 
 (def DEFAULT-CHUNKSIZE 5)
 (def source-dir (or (System/getenv "SOURCEDIR") "/tmp"))
 (def source-type #".*\.java")
 
+(defn log-cpu []
+  (let [os-bean (.getOperatingSystemMXBean ManagementFactory)
+        cpu-load (* 100 (.getSystemCpuLoad os-bean))]
+    (storage/addUpdate! (str "CPU Load: " (format "%.2f" cpu-load) "%"))))
+
 (defn ts-println [& args]
-  (println (.toString (java.time.LocalDateTime/now)) args))
+  (let [message (clojure.string/join " " args)]
+    (println (.toString (java.time.LocalDateTime/now)) message)
+    (storage/addUpdate! message)))
 
 (defn maybe-clear-db [args]
   (when (some #{"CLEAR"} (map string/upper-case args))
@@ -56,12 +64,24 @@
    - Clear clears the database
    - NoRead do not read the files again
    - NoCloneID do not detect clones
-   - List print a list of all clones"
+   - List print a list of all clones
+   - Resume resume expansion from pause"
   [& args]
 
-  (maybe-clear-db args)
-  (maybe-read-files args)
-  (maybe-detect-clones args)
-  (maybe-list-clones args)
-  (ts-println "Summary")
-  (storage/print-statistics))
+  ;; Start CPU logging thread
+  (future
+    (while true
+      (log-cpu)
+      (Thread/sleep 30000)))  ;; Log every 30 seconds
+
+  (if (some #{"RESUME"} (map string/upper-case args))
+    (do
+      (ts-println "Resuming expansion...")
+      (expander/expand-clones))
+    (do
+      (maybe-clear-db args)
+      (maybe-read-files args)
+      (maybe-detect-clones args)
+      (maybe-list-clones args)
+      (ts-println "Summary")
+      (storage/print-statistics))))

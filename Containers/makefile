@@ -1,4 +1,4 @@
-all: corpusGetter codeStreamGenerator codeStreamConsumer cljDetector
+all: corpusGetter codeStreamGenerator codeStreamConsumer cljDetector monitorTool
 
 corpusGetter:
 	cd CorpusGetter && docker build -t corpusgetter .
@@ -15,6 +15,9 @@ codeStreamConsumer:
 
 cljDetector:
 	cd cljdetector && docker build -t cljdetector .
+
+monitorTool:
+	cd MonitorTool && docker build -t monitortool .
 
 clean:
 	docker rmi --force corpusgetter csgenerator

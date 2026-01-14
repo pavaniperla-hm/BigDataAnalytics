@@ -61,9 +61,18 @@
         (recur (storage/get-overlapping-candidates dbconnection merged-clone)
                merged-clone)))))
 
+(defn pause-signaled? []
+  (.exists (java.io.File. "/tmp/pause")))
+
 (defn expand-clones []
   (let [dbconnection (storage/get-dbconnection)]
     (loop [candidate (storage/get-one-candidate dbconnection)]
       (when candidate
+        (if (pause-signaled?)
+          (do
+            (println "Expansion paused. Create /tmp/resume to continue.")
+            (while (pause-signaled?)
+              (Thread/sleep 5000))  ;; Wait 5 seconds, check again
+            (println "Resuming expansion...")))
         (storage/store-clone! dbconnection (maybe-expand dbconnection candidate))
         (recur (storage/get-one-candidate dbconnection))))))
